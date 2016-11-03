@@ -1,0 +1,166 @@
+#! /bin/bash
+# Script for managing I2P testnet in LXC containers
+
+# LXC container name prefix
+NODE_PREFIX=${NODE_PREFIX:="i2pdnode"}
+# Path to containers storage on host system
+LXC_LIB=${LXC_LIB:="/var/lib/lxc"}
+# i2pd working directory inside container
+I2PD_DIR=${I2PD_DIR:="/opt/i2pd"}
+# Container's network interface
+CONT_IFNAME=${CONT_IFNAME:="eth0"}
+# Reseed URL
+RESEED_URL=${RESEED_URL:="https://10.0.3.1:8443/"}
+# This script name
+SCRIPTNAME=${SCRIPTNAME:="testnetctl"}
+
+
+# List all containers
+all_nodes ()
+{
+    lxc-ls -1 | grep $NODE_PREFIX
+}
+
+# Run i2pd in specified container
+run_i2pd ()
+{
+    [ -f $LXC_LIB/$1/rootfs/$I2PD_DIR/i2pd.log ] && rm $LXC_LIB/$1/rootfs/$I2PD_DIR/i2pd.log
+    
+    I_MODE=$( echo $1 | cut -d "-" -f 2 )
+    I_COMMAND="$I2PD_DIR/run_i2pd.sh"
+    if [ "$I_MODE" == "ff" ]; then
+        I_COMMAND=$I_COMMAND" --floodfill"
+    fi
+
+    lxc-attach -n $1 -- $I_COMMAND 
+    echo "$1 --> i2pd ready"
+}
+
+# Stop i2pd in specified container
+stop_i2pd ()
+{
+    lxc-attach -n $1 -- $I2PD_DIR/stop_i2pd.sh
+}
+
+# Escape slashes for sed
+escape_slashes () { echo $1|sed 's/\//\\\//g'; }
+
+case "$1" in
+    prepare)
+        # Create specified amount of LXC containers
+        NODES_COUNT=$2
+        if [ "$NODES_COUNT" == "" ]; then
+            echo "Usage: $SCRIPTNAME prepare [# of nodes]" >&2
+            exit 3
+        fi
+
+        for x in $( seq 1 $NODES_COUNT ); do
+            if [ $x -lt 6 ]; then
+                # ff node
+                NODE_NAME=$NODE_PREFIX"-ff-"$RANDOM
+            else
+                NODE_NAME=$NODE_PREFIX"-n-"$RANDOM
+            fi
+            lxc-create -t ubuntu -n $NODE_NAME --  --release xenial -a amd64
+            echo "$NODE_NAME --> created"
+        done
+        echo "[!] System is prepared" 
+        ;;
+    clean)
+        # Destroy all containers
+        for x in $(all_nodes); do
+            lxc-destroy -n $x -f -s 
+        done
+        echo "[!] System is cleaned" 
+        ;;
+    re-install)
+        # Re-install i2pd distro to all containers
+        DISTRO=dist
+        # install config/scripts to dist dir
+        for x in $(ls templates); do
+            cp templates/$x $DISTRO/$x
+            sed -i 's/CONT_IFNAME/'$CONT_IFNAME'/g' $DISTRO/$x
+
+            sed -i 's/I2PD_DIR/'$(escape_slashes $I2PD_DIR)'/g' $DISTRO/$x 
+            sed -i 's/RESEED_URL/'$(escape_slashes $RESEED_URL)'/g' $DISTRO/$x 
+        done
+
+        for x in $(all_nodes); do
+            # RM everything && re-install dist
+            [ -d $LXC_LIB/$x/rootfs$I2PD_DIR ] && rm -rf $LXC_LIB/$x/rootfs$I2PD_DIR
+            cp -R $DISTRO $LXC_LIB/$x/rootfs$I2PD_DIR
+        done
+        echo "[!] Re-installed i2pd distro" 
+        ;;
+    re-install-binary)
+        # Re-install i2pd binary to all containers
+        DISTRO=dist
+
+        for x in $(all_nodes); do
+            cp $DISTRO/i2pd $LXC_LIB/$x/rootfs$I2PD_DIR/i2pd
+        done
+        echo "[!] Re-installed i2pd binary" 
+        ;;
+    collect_reseed_data)
+        # Collect initial router.info files and place them into NETDB folder
+        # for creating .su3 file later
+        NETDB=netDb
+        rm -rf $NETDB/*dat
+
+        INIT_NODES=$( echo "$(all_nodes)"| grep "$NODE_PREFIX"-ff | head -n 1 )
+
+        for x in $INIT_NODES; do 
+            lxc-start -n $x -d
+            run_i2pd $x
+            sleep 3
+            stop_i2pd $x
+            lxc-stop -n $x
+
+            echo "$x --> copying RI"
+            cp $LXC_LIB/$x/rootfs$I2PD_DIR/router.info $NETDB/$x.dat
+        done
+
+        echo "[!] netDb folder is ready" 
+        ;;
+    run)
+        # Run I2P network: start all containers and run i2pd in them
+        for x in $(all_nodes); do
+            lxc-start -n $x -d && echo "$x --> up"
+        done
+        sleep 5
+
+        for x in $(all_nodes); do
+            run_i2pd $x
+        done
+        echo "[!] Network is UP" 
+        ;;
+    stop)
+        # Stop I2P network
+        for x in $(all_nodes); do
+            stop_i2pd $x
+            lxc-stop -n $x && echo "$x --> down"
+        done
+        echo "[!] Network is DOWN" 
+        ;;
+    status)
+        # Display brief info about containers
+        for x in $(all_nodes); do
+            STATE=$( lxc-info -s -n $x|cut -d " " -f 11 )
+            RES="$x --> $STATE"
+            if [ "$STATE" != "STOPPED" ]; then
+                ADDR=$( lxc-info -i -n $x|cut -d " " -f 14 )
+                RES="$RES --> $ADDR"
+            fi
+
+            echo "$RES"
+        done
+        ;;
+    *)
+        # Wow, you can read the source code!
+        echo "Usage: $SCRIPTNAME {prepare|clean|re-install|re-install-binary|collect_reseed_data|run|stop|status}" >&2
+        exit 3
+        ;;
+
+esac
+
+exit 0
