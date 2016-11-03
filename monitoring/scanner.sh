@@ -1,8 +1,8 @@
 #! /bin/bash
 # Disciver alive hosts in the subnet
 
-SUBNET=$1
-OUTFILE=$2
+OUTFILE=$1
+SUBNET=$2
 
 if [ ! $SUBNET ]; then
     SUBNET="10.0.3."
